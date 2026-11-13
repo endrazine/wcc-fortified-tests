@@ -119,7 +119,7 @@ the Zenodo artifact:
                {\_FORTIFY\_SOURCE} Functions},
   year      = {2026},
   publisher = {Zenodo},
-  doi       = {10.5281/zenodo.XXXXXXX}
+  doi       = {10.5281/zenodo.24201454}
 }
 ```
 
