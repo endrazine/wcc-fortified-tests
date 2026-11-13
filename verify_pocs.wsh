@@ -1,0 +1,1193 @@
+--
+-- verify_pocs.wsh — PoC verification, truncation & simplification
+--
+-- Usage:
+--   wsh -x verify_pocs.wsh
+--   verifypocs("/tmp/witchcraft-pocs.log")
+--
+-- For each PoC, we:
+--   1) Fork + verify the crash reproduces (same signal, same mode)
+--   2) Truncate: find minimum number of leading args that still crash
+--   3) Simplify: replace each arg with a deterministic simple value
+--   4) Identify which argument controls the crash (faultaddr == arg value)
+--   5) Deduplicate: one best PoC per (function, signal, mode, controlling arg)
+--
+-- Output: /tmp/witchcraft-pocs-minimized.log
+--
+
+loadbin("/usr/lib/x86_64-linux-gnu/libc.so.6")
+
+-- Lua compat: table.unpack is 5.2+, unpack is 5.1
+local unp = table.unpack or unpack
+
+-- IPC file: child writes result here, parent reads it
+local RESULT_FILE = "/tmp/.wsh_poc_result"
+
+-- Per-argument simplification values: arg1 → 0x41414141, arg2 → 0x42424242, etc.
+-- The crash address itself encodes which argument controls the fault:
+-- "SIGSEGV at 0x43434343" immediately tells you arg3 is the attack vector.
+-- All > 0x1000 (4096) to prove exploitability (not just a NULL deref).
+local SIMPLE_INT_FOR_ARG = {
+	"0x41414141",  -- arg1
+	"0x42424242",  -- arg2
+	"0x43434343",  -- arg3
+	"0x44444444",  -- arg4
+	"0x45454545",  -- arg5
+	"0x46464646",  -- arg6
+}
+-- Fallback values when the per-arg marker doesn't trigger the crash
+-- Small positive sizes first (for length/count args like memcpy's 3rd),
+-- then classic sentinel values.
+local SIMPLE_INT_FALLBACKS = {
+	"0xff",
+	"0x3",
+	"0xdeadbeef",
+	"0x13371337",
+}
+
+local SIMPLE_STR = '"aaaa"'
+
+------------------------------------------------------------------------
+-- Convert a string-representation of an argument to an actual Lua value
+-- "0x41414141"  → number 0x41414141
+-- '"/bin/ls"'   → string "/bin/ls"
+------------------------------------------------------------------------
+local function convert_arg(s)
+	if s:sub(1, 1) == '"' and s:sub(-1) == '"' then
+		-- Quoted string: strip outer quotes, handle basic escapes
+		return (s:sub(2, -2):gsub("\\(.)", function(c)
+			if c == 'n' then return '\n'
+			elseif c == 't' then return '\t'
+			elseif c == 'r' then return '\r'
+			elseif c == '\\' then return '\\'
+			elseif c == '"' then return '"'
+			else return c end
+		end))
+	else
+		-- Number (hex 0x... or decimal)
+		return tonumber(s) or 0
+	end
+end
+
+------------------------------------------------------------------------
+-- Argument tokenizer: split "0x41414141, \"/bin/ls\", 0x0" into a table
+-- Handles quoted strings (with possible escaped chars) and bare tokens.
+------------------------------------------------------------------------
+local function tokenize_args(s)
+	local args = {}
+	local pos = 1
+	local len = #s
+
+	while pos <= len do
+		-- skip whitespace
+		while pos <= len and s:sub(pos, pos):match("%s") do pos = pos + 1 end
+		if pos > len then break end
+
+		if s:sub(pos, pos) == '"' then
+			-- Quoted string: scan to closing quote
+			local start = pos
+			pos = pos + 1
+			while pos <= len do
+				local c = s:sub(pos, pos)
+				if c == '\\' then
+					pos = pos + 2  -- skip escaped char
+				elseif c == '"' then
+					pos = pos + 1
+					break
+				else
+					pos = pos + 1
+				end
+			end
+			args[#args + 1] = s:sub(start, pos - 1)
+		else
+			-- Bare token (number, hex, identifier): scan to comma
+			local start = pos
+			while pos <= len and s:sub(pos, pos) ~= ',' do pos = pos + 1 end
+			local tok = s:sub(start, pos - 1):match("^%s*(.-)%s*$")
+			if tok and #tok > 0 then
+				args[#args + 1] = tok
+			end
+		end
+
+		-- skip comma
+		while pos <= len and s:sub(pos, pos):match("[,%s]") do pos = pos + 1 end
+	end
+
+	return args
+end
+
+------------------------------------------------------------------------
+-- Parse a PoC line into components
+-- Returns: funcname, args_table, expected_signal, expected_mode, expected_addr_str
+-- or nil on parse failure
+------------------------------------------------------------------------
+local function parse_poc(line)
+	-- Split on " -- "
+	local call_str, crash_str = line:match("^(.-)%s+%-%-+%s+(.+)$")
+	if not call_str or not crash_str then return nil end
+
+	-- Function name (allow underscores: %w = [A-Za-z0-9], add _)
+	local funcname = call_str:match("^([%w_]+)%(")
+	if not funcname then return nil end
+
+	-- Argument string (between outer parens)
+	local args_str = call_str:match("^[%w_]+%((.*)%)$")
+	if not args_str then return nil end
+
+	-- Tokenize arguments
+	local args = tokenize_args(args_str)
+
+	-- Parse crash info:  "SIGSEGV invalid WRITE at address 0x41414141"
+	--                    possibly followed by " [CONTROLLED]"
+	local exp_signal = crash_str:match("^(%w+)")
+	local exp_mode   = crash_str:match("invalid (%w+)")
+	local exp_addr   = crash_str:match("at address (0x%x+)")
+
+	if not exp_signal or not exp_mode then return nil end
+
+	return funcname, args, exp_signal, exp_mode, exp_addr
+end
+
+------------------------------------------------------------------------
+-- Direct call (in-process, crash recovery via libcall's setjmp/longjmp)
+-- Looks up the function by name in _G, converts args from their string
+-- representations to actual Lua values, then calls through libcall.
+-- Returns: signal, mode, faultaddr   or   nil, nil, nil
+------------------------------------------------------------------------
+local function direct_call(funcname, args)
+	local fn = _G[funcname]
+	if not fn then return nil, nil, nil end
+
+	-- Convert string representations ("0x41414141", '"/bin/ls"') to values
+	local vals = {}
+	for i, a in ipairs(args) do
+		vals[i] = convert_arg(a)
+	end
+
+	-- Call the function — libcall handles crash recovery via setjmp/longjmp
+	local ok, ret, ctx = pcall(fn, unp(vals))
+	if not ok then return nil, nil, nil end
+
+	if type(ctx) == "table" and ctx.signal and ctx.signal ~= "" then
+		local mode = "UNKNOWN"
+		if type(ctx.mode) == "string" then
+			mode = ctx.mode
+		elseif ctx.mode == 1 then
+			mode = "READ"
+		elseif ctx.mode == 2 then
+			mode = "WRITE"
+		elseif ctx.mode == 4 then
+			mode = "EXEC"
+		end
+		return ctx.signal, mode, ctx.faultaddr or 0
+	end
+	return nil, nil, nil
+end
+
+------------------------------------------------------------------------
+-- Is this arg a string literal?
+------------------------------------------------------------------------
+local function is_string_arg(arg)
+	return arg:sub(1, 1) == '"'
+end
+
+------------------------------------------------------------------------
+-- Is this a stale pool string?  testfunc pre-fills pool memory with
+-- patterns like "/aaaa...", "/bbbb...", "/cccc..." (32-char paths of
+-- repeated characters).  These are valid mapped strings in Lua but
+-- point to testfunc-specific pool data — not useful for reproduction.
+-- Replacing them with markers gives controlled-address crashes.
+------------------------------------------------------------------------
+local function is_pool_string(arg)
+	if not is_string_arg(arg) then return false end
+	-- Strip quotes: "..." → ...
+	local s = arg:sub(2, -2)
+	if #s < 16 then return false end  -- short strings are fine
+	-- Pool pattern: /XXXXXXXXXXX... where X is one repeated char
+	if s:sub(1, 1) == "/" and #s >= 16 then
+		local ch = s:sub(2, 2)
+		local rep = "/" .. string.rep(ch, #s - 1)
+		if s == rep then return true end
+	end
+	return false
+end
+
+------------------------------------------------------------------------
+-- Format a PoC line in the standard copy-pasteable format
+------------------------------------------------------------------------
+local function format_poc(funcname, args, signal, mode, faultaddr)
+	return string.format("%s(%s) -- %s invalid %s at address 0x%x",
+		funcname, table.concat(args, ", "), signal, mode, faultaddr)
+end
+
+------------------------------------------------------------------------
+-- Identify which argument controls the crash: its numeric value matches
+-- the fault address.  Returns 1-based arg index, or 0 if none match.
+-- With per-arg markers (0x41..41 = arg1, 0x42..42 = arg2, ...) the
+-- fault address itself encodes the answer.
+--
+-- SIMD implementations (AVX memcpy, etc.) do aligned stores, so the
+-- fault address may be offset from the marker by up to a few KiB.
+-- We check exact match first, then near-match (within ±0x1000).
+------------------------------------------------------------------------
+local function find_controlling_arg(args, faultaddr)
+	if not faultaddr or faultaddr == 0 then return 0 end
+
+	-- Pass 1: exact match against arg values
+	for i, a in ipairs(args) do
+		if not is_string_arg(a) then
+			local val = tonumber(a)
+			if val and val == faultaddr then
+				return i
+			end
+		end
+	end
+
+	-- Pass 2: exact match against per-arg marker table
+	for i, marker in ipairs(SIMPLE_INT_FOR_ARG) do
+		if tonumber(marker) == faultaddr then
+			return i
+		end
+	end
+
+	-- Pass 3: near-match — faultaddr within ±0x1000 of an arg value.
+	-- Catches AVX/SSE aligned stores that offset the fault address.
+	local best_i, best_dist = 0, 0x1001
+	for i, a in ipairs(args) do
+		if not is_string_arg(a) then
+			local val = tonumber(a)
+			if val and val > 0x1000 then
+				local dist = faultaddr - val
+				if dist < 0 then dist = -dist end
+				if dist < best_dist then
+					best_dist = dist
+					best_i = i
+				end
+			end
+		end
+	end
+	return best_i
+end
+
+------------------------------------------------------------------------
+-- Build safe args: replace only stale 48-bit pool addresses (> 32-bit)
+-- with per-arg markers.  Keep strings and 32-bit values as-is.
+-- This preserves small constants like confstr's name arg (0x3), while
+-- sanitising stale mmap'd pool addresses (0x61616161c00 etc.) that
+-- would land near live heap metadata and corrupt glibc's tcache.
+------------------------------------------------------------------------
+local function build_safe_args(args)
+	local safe = {}
+	for i = 1, #args do
+		if is_string_arg(args[i]) then
+			safe[i] = args[i]
+		else
+			local val = tonumber(args[i]) or 0
+			if val > 0xFFFFFFFF then  -- 48-bit stale pool address
+				safe[i] = SIMPLE_INT_FOR_ARG[i] or "0x41414141"
+			else
+				safe[i] = args[i]  -- keep original 32-bit value
+			end
+		end
+	end
+	return safe
+end
+
+------------------------------------------------------------------------
+-- Single-call fork: fork a child that makes exactly ONE function call,
+-- writes result, and exits.  No signal-handler state degradation.
+-- Returns: signal, mode, faultaddr  or  nil, nil, 0
+------------------------------------------------------------------------
+local function single_call_fork(funcname, args)
+	os.remove(RESULT_FILE)
+	local pid = fork()
+	if pid == 0 then
+		-- CHILD: one call, write result, exit
+		local ok, sig, mode, faddr = pcall(function()
+			return direct_call(funcname, args)
+		end)
+		local f = io.open(RESULT_FILE, "w")
+		if f then
+			if ok and sig then
+				f:write(tostring(sig) .. "\n")
+				f:write(tostring(mode) .. "\n")
+				f:write(string.format("0x%x", faddr or 0) .. "\n")
+			else
+				f:write("FAIL\n")
+			end
+			f:close()
+		end
+		local _e = _exit or _Exit
+		if _e then _e(0) else os.exit(0) end
+		return
+	end
+	-- PARENT: reap with 5-second timeout
+	local reaped = false
+	for _ = 1, 50 do
+		local ret = waitpid(pid, 0, 1)  -- WNOHANG
+		if ret ~= 0 then reaped = true; break end
+		usleep(100000)
+	end
+	if not reaped then
+		kill(pid, 9); waitpid(pid, 0, 0)
+		return nil, nil, 0
+	end
+	local rf = io.open(RESULT_FILE, "r")
+	if not rf then return nil, nil, 0 end
+	local line1 = rf:read("*l")
+	if not line1 or line1 == "FAIL" then rf:close(); return nil, nil, 0 end
+	local line2 = rf:read("*l")
+	local line3 = rf:read("*l")
+	rf:close()
+	return line1, line2 or "UNKNOWN", tonumber(line3 or "0") or 0
+end
+
+------------------------------------------------------------------------
+-- Phase 2a: Truncate — find minimum leading args that still crash
+-- Test with 1 arg, 2 args, ... stop at first that crashes with the
+-- expected signal.  We accept any mode here (pool addresses may cause
+-- READ instead of WRITE), but require faultaddr > 0x1000 to reject
+-- NULL/low-page crashes from missing varargs (e.g. dprintf with %n
+-- but no arg3+).  Simplification will then fix args right-to-left
+-- and enforce the correct mode.
+------------------------------------------------------------------------
+local function truncate(funcname, args, exp_sig, exp_mode)
+	for n = 1, #args - 1 do
+		local subset = {}
+		for i = 1, n do subset[i] = args[i] end
+
+		local sig, mode, faddr = direct_call(funcname, subset)
+		if sig == exp_sig and faddr and faddr > 0x1000 then
+			return subset
+		end
+	end
+	return args  -- all args needed
+end
+
+------------------------------------------------------------------------
+-- Phase 2b: Simplify — replace each arg with the simplest deterministic
+-- value that still triggers the same crash.
+--
+-- RIGHT-TO-LEFT order: source/size/count args (typically later positions)
+-- get simplified to readable values first, so when we then simplify the
+-- destination pointer (typically arg1 or arg2), the function can actually
+-- reach its write.  Without this, functions like strncpy(dst, src, n)
+-- fail because unmapped pool addresses in src/n cause a READ crash before
+-- the WRITE to dst ever happens.
+--
+-- TWO-PASS when verify detected a mode mismatch (relaxed_first=true):
+-- Functions like memcpy(dst, src, n) where ALL args are stale pool
+-- addresses create a circular dependency: you can't fix ANY arg with
+-- strict mode matching because the OTHER stale args cause the wrong crash
+-- mode.  The solution:
+--   Pass 1 (relaxed): signal + faultaddr > 0x1000 only (no mode check).
+--     Candidate order: small ints → "aaaa" → marker → sentinels.
+--     The faultaddr > 0x1000 check steers the selection naturally:
+--     - Size args: 0x3 accepted (crash on stale ptrs, addr > 0x1000)
+--     - Source ptrs: 0x3/0xff rejected (addr < 0x1000), "aaaa" accepted
+--       (readable, crash on stale dst > 0x1000)
+--     - Dest ptrs: small/readable all pass through harmlessly, marker
+--       accepted (crash addr > 0x1000)
+--   Pass 2 (strict): signal + mode match.
+--     Upgrades neutralised values to diagnostic markers where possible.
+------------------------------------------------------------------------
+local function simplify(funcname, args, exp_sig, exp_mode, relaxed_first)
+	local result = {}
+	for i = 1, #args do result[i] = args[i] end
+
+	----------------------------------------------------------------------
+	-- Pass 1 (optional): Relaxed — neutralise stale pool addresses.
+	-- Match on: signal only + faultaddr > 0x1000.
+	-- Candidate order: small ints, readable string, per-arg marker, sentinels.
+	----------------------------------------------------------------------
+	if relaxed_first then
+		for i = #result, 1, -1 do
+			local orig = result[i]
+			local marker = SIMPLE_INT_FOR_ARG[i]
+			local found = false
+
+			-- Build relaxed candidate list: small ints first (good for
+			-- size/count args), then "aaaa" (good for source pointers),
+			-- then per-arg marker (good for dest pointers), then sentinels
+			local relaxed = {"0x3", "0xff", SIMPLE_STR}
+			if marker then relaxed[#relaxed + 1] = marker end
+			relaxed[#relaxed + 1] = "0xdeadbeef"
+			relaxed[#relaxed + 1] = "0x13371337"
+
+			for _, val in ipairs(relaxed) do
+				result[i] = val
+				local sig, mode, faddr = direct_call(funcname, result)
+				if sig == exp_sig and faddr and faddr > 0x1000 then
+					found = true
+					break
+				end
+			end
+
+			if not found then
+				result[i] = orig
+			end
+		end
+	end
+
+	----------------------------------------------------------------------
+	-- Pass 2 (always): Strict — match on signal + mode.
+	-- Candidate order: per-arg marker (self-documenting crash addr),
+	-- then "aaaa" (readable source), then integer fallbacks.
+	----------------------------------------------------------------------
+	for i = #result, 1, -1 do
+		local orig = result[i]
+		local marker = SIMPLE_INT_FOR_ARG[i]
+		local found = false
+
+		-- 1) Per-arg integer marker (best: self-documenting crash addr)
+		if marker then
+			result[i] = marker
+			local sig, mode = direct_call(funcname, result)
+			if sig == exp_sig and mode == exp_mode then
+				found = true
+			end
+		end
+
+		if not found then
+			-- 2) "aaaa" — valid readable memory; works for source pointers
+			--    even if the original arg was an integer (unmapped pool addr)
+			result[i] = SIMPLE_STR
+			local sig, mode = direct_call(funcname, result)
+			if sig == exp_sig and mode == exp_mode then
+				found = true
+			end
+		end
+
+		if not found then
+			-- 3) Integer fallbacks (small sizes, then sentinels)
+			for _, simple_val in ipairs(SIMPLE_INT_FALLBACKS) do
+				result[i] = simple_val
+				local sig, mode = direct_call(funcname, result)
+				if sig == exp_sig and mode == exp_mode then
+					found = true
+					break
+				end
+			end
+		end
+
+		if not found then
+			result[i] = orig  -- revert: nothing worked
+		end
+	end
+
+	return result
+end
+
+------------------------------------------------------------------------
+-- Process one PoC inside a forked child.
+-- Does verify → truncate → simplify, writes result to RESULT_FILE.
+--
+-- Stale 48-bit pool addresses (0x61616161c00 etc.) are replaced with
+-- per-arg markers (0x41414141 etc.) via build_safe_args().  Only values
+-- > 0xFFFFFFFF are replaced — small 32-bit constants (confstr name=0x3,
+-- ioctl commands, boundary values) are preserved as-is.
+--
+-- The final result is mode-checked: if the simplified PoC produces a
+-- different mode than the input (e.g. WRITE became READ), the child
+-- writes FAIL so the pipeline tries other PoCs or the second pass.
+------------------------------------------------------------------------
+local function child_process(funcname, args, exp_sig, exp_mode)
+	-- Sanitise: replace only stale 48-bit pool addresses with markers.
+	-- Keep string literals AND 32-bit integer values (constants like
+	-- confstr's name=0x3, ioctl commands, etc.) untouched.
+	local safe_args = build_safe_args(args)
+
+	-- Step 1: Verify — confirm the function still crashes with the
+	-- expected signal using safe marker addresses.
+	local sig, mode, faddr = direct_call(funcname, safe_args)
+	if sig ~= exp_sig then
+		local f = io.open(RESULT_FILE, "w")
+		if f then f:write("FAIL\n"); f:close() end
+		return
+	end
+
+	-- Step 2a: Truncate (signal match + faultaddr>0x1000; mode relaxed)
+	local short_args = truncate(funcname, safe_args, exp_sig, exp_mode)
+
+	-- Step 2b: Simplify (right-to-left).
+	-- If verify mode matched expected, use strict matching only.
+	-- If mode differed (markers may produce READ before WRITE), do a
+	-- relaxed pass first to neutralise, then strict to upgrade to
+	-- diagnostic markers.
+	local need_relaxed = (mode ~= exp_mode)
+	local simple_args = simplify(funcname, short_args, exp_sig, exp_mode, need_relaxed)
+
+	-- Get final crash info with simplified args
+	local fsig, fmode, ffaddr = direct_call(funcname, simple_args)
+	if not fsig then
+		fsig, fmode, ffaddr = sig, mode, faddr
+	end
+
+	-- Reject mode downgrades: if the input was WRITE but simplified
+	-- args produce READ, the PoC is less exploitable than claimed.
+	-- Also reject low fault addresses (≤ 0x1000): NULL-page crashes
+	-- from missing varargs aren't exploitable.
+	-- Fail here so the pipeline tries other PoCs or the second pass.
+	if fmode ~= exp_mode or not ffaddr or ffaddr <= 0x1000 then
+		local f = io.open(RESULT_FILE, "w")
+		if f then f:write("FAIL\n"); f:close() end
+		return
+	end
+
+	-- Identify which argument controls the fault address
+	local ctrl_arg = find_controlling_arg(simple_args, ffaddr)
+
+	-- Write result: line 1 = controlling arg index, line 2 = PoC
+	local f = io.open(RESULT_FILE, "w")
+	if f then
+		f:write(tostring(ctrl_arg) .. "\n")
+		f:write(format_poc(funcname, simple_args, fsig, fmode, ffaddr) .. "\n")
+		f:close()
+	end
+end
+
+------------------------------------------------------------------------
+-- verifypocs(infile) — main entry point
+------------------------------------------------------------------------
+function verifypocs(infile)
+	infile = infile or "/tmp/witchcraft-pocs.log"
+
+	-- Output files
+	local outverified  = "/tmp/witchcraft-verified-pocs.log"
+	local outminimized = "/tmp/witchcraft-minimized-pocs.log"
+
+	print("=== PoC Verification & Minimization ===")
+	print("Input:     " .. infile)
+	print("Verified:  " .. outverified)
+	print("Minimized: " .. outminimized)
+	print("")
+
+	-- Read all lines
+	local fi = io.open(infile, "r")
+	if not fi then
+		print("ERROR: Cannot open " .. infile)
+		return
+	end
+
+	local lines = {}
+	for line in fi:lines() do
+		if #line > 0 then lines[#lines + 1] = line end
+	end
+	fi:close()
+
+	print(string.format("Total PoCs to process: %d", #lines))
+
+	-- Pre-check: which unique functions from the log exist in _G?
+	local all_funcs = {}
+	for _, line in ipairs(lines) do
+		local fn = line:match("^([%w_]+)%(")
+		if fn then all_funcs[fn] = true end
+	end
+	local missing = {}
+	for fn, _ in pairs(all_funcs) do
+		if not _G[fn] then missing[#missing + 1] = fn end
+	end
+	table.sort(missing)
+	if #missing > 0 then
+		print(string.format("\nWARNING: %d/%d functions NOT found in _G:",
+			#missing, #missing + (function()
+				local c = 0; for _ in pairs(all_funcs) do c = c + 1 end; return c - #missing
+			end)()))
+		for _, fn in ipairs(missing) do
+			io.write("  " .. fn)
+		end
+		io.write("\n")
+	else
+		local c = 0; for _ in pairs(all_funcs) do c = c + 1 end
+		print(string.format("\nAll %d functions found in _G.", c))
+	end
+	print("")
+
+	-- Best PoC per composite key: "func:signal:mode:ctrl_arg" → { line, nargs, ... }
+	local best = {}
+	-- Attempt counter per (func, signal, mode) — skip after enough tries
+	local attempts = {}
+	local stats = {
+		total     = 0,
+		verified  = 0,
+		failed    = 0,
+		parse_err = 0,
+		skipped   = 0,
+		timeout   = 0,
+	}
+
+	-- Open verified output (appended as we go, deduplicated)
+	local fv = io.open(outverified, "w")
+	local seen = {}  -- dedup: seen[poc_line] = true
+
+	local t_start = os.time()
+
+	for i, line in ipairs(lines) do
+		stats.total = stats.total + 1
+
+		-- Parse
+		local funcname, args, exp_sig, exp_mode, exp_addr = parse_poc(line)
+		if not funcname then
+			stats.parse_err = stats.parse_err + 1
+			goto nextline
+		end
+
+		-- Skip if we've already tried enough PoCs for this (func, sig, mode)
+		-- After 15 attempts we've likely found all distinct controlling args
+		local attempt_key = funcname .. ":" .. exp_sig .. ":" .. exp_mode
+		attempts[attempt_key] = (attempts[attempt_key] or 0) + 1
+		if attempts[attempt_key] > 15 then
+			stats.skipped = stats.skipped + 1
+			goto nextline
+		end
+
+		-- Progress
+		if i % 25 == 0 or i == 1 or i == #lines then
+			local elapsed = os.difftime(os.time(), t_start)
+			io.write(string.format(
+				"\r  [%d/%d] %-20s verified:%d failed:%d elapsed:%ds   ",
+				i, #lines, funcname, stats.verified, stats.failed, elapsed))
+			io.flush()
+		end
+
+		-- Fork: isolate each PoC test
+		os.remove(RESULT_FILE)
+		local pid, ctx = fork()
+
+		if pid == 0 then
+			-- CHILD PROCESS
+			-- Wrap in pcall: if child_process crashes at the Lua level
+			-- (not caught by libcall's longjmp), we still write FAIL and exit.
+			local ok, err = pcall(child_process, funcname, args, exp_sig, exp_mode)
+			if not ok then
+				-- Lua-level crash: ensure we write FAIL so parent knows
+				local f = io.open(RESULT_FILE, "w")
+				if f then f:write("FAIL\n"); f:close() end
+			end
+			-- Always exit.  _exit() avoids flushing parent's stdio buffers.
+			local _e = _exit or _Exit
+			if _e then _e(0) else os.exit(0) end
+			return  -- unreachable
+		end
+
+		-- PARENT: wait for child with timeout (avoid blocking on stuck children)
+		-- WNOHANG = 1; poll for up to 10 seconds then SIGKILL
+		local reaped = false
+		for _ = 1, 100 do
+			local ret = waitpid(pid, 0, 1)	-- WNOHANG
+			if ret ~= 0 then
+				reaped = true
+				break
+			end
+			usleep(100000)	-- 100ms
+		end
+		if not reaped then
+			-- Child stuck: kill it and reap
+			kill(pid, 9)	-- SIGKILL
+			waitpid(pid, 0, 0)
+			stats.timeout = stats.timeout + 1
+			if stats.timeout <= 5 then
+				io.write(string.format(
+					"\n  TIMEOUT: %s (attempt %d) — killed stuck child\n",
+					funcname, attempts[attempt_key]))
+				io.flush()
+			end
+			goto nextline
+		end
+
+		-- Read result (line 1: ctrl_arg index, line 2: PoC)
+		local rf = io.open(RESULT_FILE, "r")
+		if rf then
+			local ctrl_line = rf:read("*l")
+			local result_line = rf:read("*l")
+			rf:close()
+
+			if ctrl_line and ctrl_line ~= "FAIL" and result_line then
+				stats.verified = stats.verified + 1
+				local ctrl_arg = tonumber(ctrl_line) or 0
+
+				-- Parse the minimized result for its signal/mode/nargs
+				local min_fname, min_args, min_sig, min_mode = parse_poc(result_line)
+				local nargs = min_args and #min_args or 99
+				local sig_str = min_sig or exp_sig
+				local mode_str = min_mode or exp_mode
+
+				-- Composite dedup key: one entry per unique crash primitive
+				local dedup_key = funcname .. ":" .. sig_str .. ":" .. mode_str
+					.. ":" .. tostring(ctrl_arg)
+
+				-- Write to verified log (deduplicated by composite key)
+				if not seen[dedup_key] then
+					seen[dedup_key] = true
+					-- Annotate with controlling arg info
+					local annotation = ""
+					if ctrl_arg > 0 then
+						annotation = " [CONTROLLED arg" .. ctrl_arg .. "]"
+					end
+					fv:write(result_line .. annotation .. "\n")
+					fv:flush()
+				end
+
+				-- Keep best (fewest args) per composite key
+				if not best[dedup_key] or nargs < best[dedup_key].nargs then
+					best[dedup_key] = {
+						line     = result_line,
+						nargs    = nargs,
+						func     = funcname,
+						ctrl_arg = ctrl_arg,
+					}
+				end
+			else
+				stats.failed = stats.failed + 1
+			end
+		else
+			-- Child died before writing (uncaught crash, timeout, etc.)
+			stats.failed = stats.failed + 1
+		end
+
+		::nextline::
+	end
+
+	local elapsed_pass1 = os.difftime(os.time(), t_start)
+
+	-- Print first-pass summary
+	print(string.format("\r\n=== First pass (%ds) ===                            ", elapsed_pass1))
+	print(string.format("Verified: %d  Failed: %d  Timeouts: %d  Parse-err: %d  Skipped: %d",
+		stats.verified, stats.failed, stats.timeout, stats.parse_err, stats.skipped))
+
+	--------------------------------------------------------------------
+	-- SECOND PASS: single-call forks for missing functions.
+	-- Each crashing call gets its own fork (one crash per child) to
+	-- avoid signal-handler state degradation from repeated longjmp.
+	-- After verify, a quick right-to-left "aaaa" sweep tries to
+	-- recover the correct crash mode (WRITE vs READ).
+	-- Functions that still can't be verified get their original PoC
+	-- with safe args, annotated [UNVERIFIED].
+	--------------------------------------------------------------------
+
+	-- Which functions already have a CONTROLLED verified PoC?
+	-- Functions verified only at uncontrolled addresses (heap boundary
+	-- crashes from signal-handler degradation) get retried in pass 2
+	-- where single-call forks avoid degradation.
+	local verified_controlled = {}
+	for key, info in pairs(best) do
+		if info.func and info.ctrl_arg and info.ctrl_arg > 0 then
+			verified_controlled[info.func] = true
+		end
+	end
+
+	-- Collect functions to retry: missing OR verified-but-uncontrolled
+	local missing_funcs = {}   -- funcname → { poc_lines }
+	local missing_order = {}   -- preserve order
+	for _, line in ipairs(lines) do
+		local fn = line:match("^([%w_]+)%(")
+		if fn and not verified_controlled[fn] and _G[fn] then
+			if not missing_funcs[fn] then
+				missing_funcs[fn] = {}
+				missing_order[#missing_order + 1] = fn
+			end
+			if #missing_funcs[fn] < 5 then
+				missing_funcs[fn][#missing_funcs[fn] + 1] = line
+			end
+		end
+	end
+
+	local n_missing = #missing_order
+	local pass2_verified = 0
+	local pass2_unverified = 0
+
+	if n_missing > 0 then
+		print(string.format(
+			"\n=== Second pass: %d missing functions (single-call forks) ===\n",
+			n_missing))
+
+		for _, fn in ipairs(missing_order) do
+			local poc_lines = missing_funcs[fn]
+			local found = false
+
+			for _, poc_line in ipairs(poc_lines) do
+				local funcname, args, exp_sig, exp_mode = parse_poc(poc_line)
+				if not funcname then goto next_poc end
+
+				-- Build safe args: replace stale pool addresses AND
+				-- pool strings ("/bbb...") with per-arg markers.
+				-- Pool strings are valid mapped Lua memory, so functions
+				-- that write to them corrupt the heap instead of cleanly
+				-- faulting at a controlled address.
+				local safe_args = {}
+				for i = 1, #args do
+					if is_pool_string(args[i]) then
+						safe_args[i] = SIMPLE_INT_FOR_ARG[i] or "0x41414141"
+					elseif is_string_arg(args[i]) then
+						safe_args[i] = args[i]
+					else
+						local val = tonumber(args[i]) or 0
+						if val > 0xFFFFFFFF then
+							safe_args[i] = SIMPLE_INT_FOR_ARG[i]
+								or "0x41414141"
+						else
+							safe_args[i] = args[i]
+						end
+					end
+				end
+
+				-- Strategy 1: verify as-is
+				local sig, mode, faddr =
+					single_call_fork(funcname, safe_args)
+
+				io.write(string.format(
+					"    [%s] try1: sig=%s mode=%s faddr=0x%x\n",
+					funcname,
+					tostring(sig), tostring(mode),
+					faddr or 0))
+				io.flush()
+
+				if sig == exp_sig and faddr and faddr > 0x1000 then
+					-- Mode fix: replace non-string args with "aaaa"
+					-- right-to-left to make the function reach its
+					-- write destination.
+					if mode ~= exp_mode then
+						for j = #safe_args, 1, -1 do
+							if not is_string_arg(safe_args[j]) then
+								local orig = safe_args[j]
+								safe_args[j] = SIMPLE_STR
+								local s2, m2, f2 =
+									single_call_fork(funcname, safe_args)
+								if s2 == exp_sig
+								   and m2 == exp_mode
+								   and f2 and f2 > 0x1000 then
+									sig   = s2
+									mode  = m2
+									faddr = f2
+									break
+								end
+								safe_args[j] = orig
+							end
+						end
+					end
+				end
+
+				-- Strategy 2: if strategy 1 didn't get right mode,
+				-- try progressively: for each position right-to-left,
+				-- try "aaaa" then small-int (0x3), keeping changes
+				-- that help.  This handles functions needing readable
+				-- src AND small size simultaneously.
+				--
+				-- Track best "controlled" state: the sweep may pass
+				-- through a combination where faddr matches a marker
+				-- (controlled) and then keep going, ending with an
+				-- uncontrolled heap addr.  We snapshot the best
+				-- controlled state to fall back to.
+				if not (sig == exp_sig and mode == exp_mode
+						and faddr and faddr > 0x1000) then
+					-- Reset to full-marker args
+					for i = 1, #args do
+						if is_string_arg(args[i])
+						   and not is_pool_string(args[i]) then
+							safe_args[i] = args[i]
+						else
+							safe_args[i] = SIMPLE_INT_FOR_ARG[i]
+								or "0x41414141"
+						end
+					end
+
+					-- Best-controlled snapshot: args + result where
+					-- faddr is near a known marker
+					local best_ctrl_args = nil
+					local best_ctrl_sig, best_ctrl_mode, best_ctrl_faddr
+
+					-- Helper: is faddr near a marker (within ±0x1000)?
+					local function is_controlled(fa)
+						if not fa or fa <= 0x1000 then return false end
+						for k = 1, 6 do
+							local m = tonumber(SIMPLE_INT_FOR_ARG[k])
+							if m then
+								local d = fa - m
+								if d < 0 then d = -d end
+								if d <= 0x1000 then return true end
+							end
+						end
+						return false
+					end
+
+					-- Snapshot if this is a controlled result
+					local function maybe_snapshot(s, m, fa)
+						if s == exp_sig and m == exp_mode
+						   and fa and fa > 0x1000
+						   and is_controlled(fa) then
+							best_ctrl_args = {}
+							for k = 1, #safe_args do
+								best_ctrl_args[k] = safe_args[k]
+							end
+							best_ctrl_sig = s
+							best_ctrl_mode = m
+							best_ctrl_faddr = fa
+						end
+					end
+
+					-- Progressive sweep: right-to-left, try "aaaa"
+					-- and 0x3 for each position, keep if it helped
+					for j = #safe_args, 1, -1 do
+						local orig = safe_args[j]
+						if not is_string_arg(orig) then
+							-- Try "aaaa"
+							safe_args[j] = SIMPLE_STR
+							local s2, m2, f2 =
+								single_call_fork(funcname, safe_args)
+							if s2 == exp_sig and f2 and f2 > 0x1000 then
+								if m2 == exp_mode then
+									sig = s2; mode = m2; faddr = f2
+									maybe_snapshot(s2, m2, f2)
+								end
+								-- Keep "aaaa" — it helped (right signal
+								-- even if mode not yet right)
+							else
+								-- Try small int (good for size args)
+								safe_args[j] = "0x3"
+								s2, m2, f2 =
+									single_call_fork(funcname, safe_args)
+								if s2 == exp_sig
+								   and f2 and f2 > 0x1000 then
+									if m2 == exp_mode then
+										sig = s2; mode = m2; faddr = f2
+										maybe_snapshot(s2, m2, f2)
+									end
+								else
+									safe_args[j] = orig  -- revert
+								end
+							end
+						end
+					end
+
+					-- Strategy 3: combo sweep — try pairs of changes.
+					-- Copy functions (memcpy, strcpy, etc.) need BOTH
+					-- a readable src (arg2) AND a small size (arg3)
+					-- to reach the write destination.  The per-position
+					-- sweep can't discover this because each position
+					-- alone isn't enough.
+					if not (sig == exp_sig and mode == exp_mode
+							and faddr and faddr > 0x1000) then
+						-- Try each pair (i,j) where i is set to "aaaa"
+						-- and j is set to each of {0x3, 0xff, "aaaa"}
+						local combo_done = false
+						for i = 1, #safe_args do
+							if combo_done then break end
+							for j = 1, #safe_args do
+								if i ~= j then
+									local oi = safe_args[i]
+									local oj = safe_args[j]
+									if not is_string_arg(oi) then
+										safe_args[i] = SIMPLE_STR
+										if not is_string_arg(oj) then
+											for _, v in ipairs(
+												{"0x3", "0xff",
+												 SIMPLE_STR}) do
+												safe_args[j] = v
+												local s2, m2, f2 =
+													single_call_fork(
+														funcname,
+														safe_args)
+												if s2 == exp_sig
+												   and m2 == exp_mode
+												   and f2
+												   and f2 > 0x1000 then
+													sig = s2
+													mode = m2
+													faddr = f2
+													maybe_snapshot(
+														s2, m2, f2)
+													combo_done = true
+													break
+												end
+											end
+										end
+										if not combo_done then
+											safe_args[i] = oi
+											safe_args[j] = oj
+										end
+									end
+								end
+								if combo_done then break end
+							end
+						end
+					end
+
+					-- ALWAYS re-verify with the final assembled args.
+					-- The sweep may have left sig/mode/faddr stale from
+					-- an intermediate combination that no longer matches
+					-- the current safe_args.
+					sig, mode, faddr =
+						single_call_fork(funcname, safe_args)
+
+					-- If final verify is worse than the best controlled
+					-- snapshot, fall back to that snapshot.
+					if best_ctrl_args
+					   and not (sig == exp_sig and mode == exp_mode
+							    and faddr and is_controlled(faddr)) then
+						for k = 1, #best_ctrl_args do
+							safe_args[k] = best_ctrl_args[k]
+						end
+						sig   = best_ctrl_sig
+						mode  = best_ctrl_mode
+						faddr = best_ctrl_faddr
+					end
+				end
+
+				-- Accept only if signal + mode match AND faddr > 0x1000
+				if sig == exp_sig and mode == exp_mode
+				   and faddr and faddr > 0x1000 then
+					local ctrl_arg =
+						find_controlling_arg(safe_args, faddr)
+					local result_line =
+						format_poc(funcname, safe_args,
+							sig, mode, faddr)
+					local dedup_key = funcname .. ":" .. sig
+						.. ":" .. mode .. ":"
+						.. tostring(ctrl_arg)
+
+					if not seen[dedup_key] then
+						seen[dedup_key] = true
+						local annotation = ""
+						if ctrl_arg > 0 then
+							annotation = " [CONTROLLED arg"
+								.. ctrl_arg .. "]"
+							-- Supersede any uncontrolled pass-1
+							-- entry for same func:sig:mode
+							local old_key = funcname .. ":" .. sig
+								.. ":" .. mode .. ":0"
+							if best[old_key] then
+								best[old_key] = nil
+								seen[old_key] = nil
+							end
+						end
+						fv:write(result_line
+							.. annotation .. "\n")
+						fv:flush()
+						best[dedup_key] = {
+							line     = result_line,
+							nargs    = #safe_args,
+							func     = funcname,
+							ctrl_arg = ctrl_arg,
+						}
+					end
+					found = true
+					pass2_verified = pass2_verified + 1
+					io.write(string.format(
+						"  + %s: %s %s at 0x%x\n",
+						funcname, sig, mode, faddr))
+					io.flush()
+					break  -- got one for this function
+				end
+
+				::next_poc::
+			end  -- poc_lines loop
+
+			-- Fallback: include with safe args + expected mode, [UNVERIFIED]
+			if not found then
+				local poc_line = poc_lines[1]
+				local funcname, args, exp_sig, exp_mode, exp_addr =
+					parse_poc(poc_line)
+				if funcname then
+					-- Full marker replacement for fallback
+					local safe_args = {}
+					for i = 1, #args do
+						if is_string_arg(args[i])
+						   and not is_pool_string(args[i]) then
+							safe_args[i] = args[i]
+						else
+							safe_args[i] = SIMPLE_INT_FOR_ARG[i]
+								or "0x41414141"
+						end
+					end
+					local presumed_faddr = tonumber(
+						SIMPLE_INT_FOR_ARG[1]) or 0x41414141
+					local result_line = format_poc(funcname, safe_args,
+						exp_sig, exp_mode, presumed_faddr)
+					local dedup_key = funcname .. ":" .. exp_sig
+						.. ":" .. exp_mode .. ":0"
+
+					if not seen[dedup_key] then
+						seen[dedup_key] = true
+						fv:write(result_line .. " [UNVERIFIED]\n")
+						fv:flush()
+						best[dedup_key] = {
+							line     = result_line .. " [UNVERIFIED]",
+							nargs    = #safe_args,
+							func     = funcname,
+							ctrl_arg = 0,
+						}
+					end
+					pass2_unverified = pass2_unverified + 1
+					io.write(string.format(
+						"  ? %s: %s %s [UNVERIFIED]\n",
+						funcname, exp_sig, exp_mode))
+					io.flush()
+				end
+			end
+		end  -- missing_order loop
+	end
+
+	fv:close()
+	local elapsed = os.difftime(os.time(), t_start)
+
+	-- Write minimized output (one best per composite key)
+	local fo = io.open(outminimized, "w")
+
+	-- Collect and sort by composite key (func name first, then signal/mode/ctrl)
+	local sorted = {}
+	for key, info in pairs(best) do
+		local annotation = ""
+		if info.ctrl_arg and info.ctrl_arg > 0 then
+			annotation = " [CONTROLLED arg" .. info.ctrl_arg .. "]"
+		end
+		sorted[#sorted + 1] = {
+			key  = key,
+			func = info.func or "?",
+			line = info.line .. annotation,
+			nargs = info.nargs,
+		}
+	end
+	table.sort(sorted, function(a, b)
+		if a.func ~= b.func then return a.func < b.func end
+		return a.key < b.key
+	end)
+
+	-- Count unique functions
+	local ufuncs = {}
+	for _, e in ipairs(sorted) do ufuncs[e.func] = true end
+	local nfuncs = 0
+	for _ in pairs(ufuncs) do nfuncs = nfuncs + 1 end
+
+	print(string.format("\r\n=== Results (%ds elapsed) ===                            ", elapsed))
+	print(string.format("Total PoCs:     %d", stats.total))
+	print(string.format("Pass 1 verified: %d", stats.verified))
+	print(string.format("Pass 1 failed:   %d", stats.failed))
+	print(string.format("Timeouts:       %d", stats.timeout))
+	print(string.format("Parse errors:   %d", stats.parse_err))
+	print(string.format("Skipped (opt):  %d", stats.skipped))
+	print(string.format("Pass 2 verified: %d", pass2_verified))
+	print(string.format("Pass 2 unverif:  %d", pass2_unverified))
+	print(string.format("Unique funcs:   %d", nfuncs))
+	print(string.format("Unique crashes: %d (func x signal x mode x ctrl_arg)", #sorted))
+	print("")
+	print("=== Minimized PoCs (one per function/signal/mode/ctrl_arg) ===")
+	print("")
+
+	for _, entry in ipairs(sorted) do
+		fo:write(entry.line .. "\n")
+		print("  " .. entry.line)
+	end
+
+	fo:close()
+
+	print("")
+	print(string.format("All verified:  %s (%d entries)", outverified,
+		stats.verified + pass2_verified))
+	print(string.format("Minimized:     %s (%d entries)", outminimized, #sorted))
+end
+
+------------------------------------------------------------------------
+-- Auto-run when invoked via: wsh -x verify_pocs.wsh
+------------------------------------------------------------------------
+verifypocs("/tmp/witchcraft-pocs.log")
+exit(0)

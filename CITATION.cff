@@ -1,0 +1,35 @@
+cff-version: 1.2.0
+type: dataset
+title: "Automated Vulnerability Testing of glibc _FORTIFY_SOURCE Functions"
+message: "If you use this dataset, please cite both the dataset and the thesis."
+authors:
+  - family-names: Brossard
+    given-names: Jonathan
+    email: endrazine@gmail.com
+    affiliation: "CNAM/CEDRIC; MOABI Solutions"
+repository-code: "https://github.com/endrazine/wcc-fortified-tests"
+license: MIT
+date-released: "2026-11-13"
+keywords:
+  - binary analysis
+  - vulnerability assessment
+  - fault oracle
+  - FORTIFY_SOURCE
+  - ELF
+  - libification
+  - procedural debugging
+references:
+  - type: thesis
+    authors:
+      - family-names: Brossard
+        given-names: Jonathan
+    title: "Beyond Reachability: Cross-Architecture Binary Libification and Procedural Debugging for Vulnerability Assessment"
+    institution:
+      name: "CNAM/CEDRIC"
+    year: 2026
+  - type: software
+    authors:
+      - family-names: Brossard
+        given-names: Jonathan
+    title: "Witchcraft Compiler Collection"
+    repository-code: "https://github.com/endrazine/wcc"
