@@ -18,5 +18,6 @@ RUN git clone https://github.com/endrazine/wcc.git && cd wcc && git checkout ce6
 
 COPY mk_fortify_pocs.sh /home/ubuntu/
 COPY verify_pocs.wsh /home/ubuntu/
+COPY verify_remaining.wsh /home/ubuntu/
 
 USER ubuntu

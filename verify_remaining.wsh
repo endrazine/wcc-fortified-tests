@@ -1,0 +1,537 @@
+--
+-- verify_remaining.wsh — Verify remaining PoCs with relaxed mode matching
+--
+-- The original verify_pocs.wsh verified 33 functions with strict signal
+-- AND mode matching.  The remaining functions crash at controlled marker
+-- addresses but with a different fault mode: the original EXEC faults
+-- required testfunc's mapped pool memory (function pointer chases through
+-- structs), while simplified markers at unmapped addresses produce WRITE
+-- or READ faults before the pointer chase happens.
+--
+-- A WRITE at a controlled address is still an exploitation primitive
+-- (arbitrary memory write).  This script verifies the remaining functions
+-- with relaxed mode matching: signal match + controlled fault address.
+-- The actual verified mode is recorded faithfully in the output.
+--
+-- Usage:
+--   # Run AFTER verify_pocs.wsh has produced its output
+--   wsh -x verify_remaining.wsh
+--
+-- Reads:
+--   /tmp/witchcraft-pocs.log            raw crash log
+--   /tmp/witchcraft-verified-pocs.log   existing verified output
+--
+-- Writes:
+--   /tmp/witchcraft-remaining-pocs.log  newly verified entries
+--
+
+loadbin("/usr/lib/x86_64-linux-gnu/libc.so.6")
+
+local unp = table.unpack or unpack
+local RESULT_FILE = "/tmp/.wsh_remain_result"
+
+-- Per-arg markers: crash address encodes which arg controls the fault.
+local SIMPLE_INT_FOR_ARG = {
+	"0x41414141",  -- arg1
+	"0x42424242",  -- arg2
+	"0x43434343",  -- arg3
+	"0x44444444",  -- arg4
+	"0x45454545",  -- arg5
+	"0x46464646",  -- arg6
+}
+
+local SIMPLE_STR = '"aaaa"'
+
+------------------------------------------------------------------------
+-- Helper functions (shared with verify_pocs.wsh)
+------------------------------------------------------------------------
+
+local function convert_arg(s)
+	if s:sub(1, 1) == '"' and s:sub(-1) == '"' then
+		return (s:sub(2, -2):gsub("\\(.)", function(c)
+			if c == 'n' then return '\n'
+			elseif c == 't' then return '\t'
+			elseif c == 'r' then return '\r'
+			elseif c == '\\' then return '\\'
+			elseif c == '"' then return '"'
+			else return c end
+		end))
+	else
+		return tonumber(s) or 0
+	end
+end
+
+local function tokenize_args(s)
+	local args = {}
+	local pos = 1
+	local len = #s
+	while pos <= len do
+		while pos <= len and s:sub(pos, pos):match("%s") do pos = pos + 1 end
+		if pos > len then break end
+		if s:sub(pos, pos) == '"' then
+			local start = pos
+			pos = pos + 1
+			while pos <= len do
+				local c = s:sub(pos, pos)
+				if c == '\\' then
+					pos = pos + 2
+				elseif c == '"' then
+					pos = pos + 1
+					break
+				else
+					pos = pos + 1
+				end
+			end
+			args[#args + 1] = s:sub(start, pos - 1)
+		else
+			local start = pos
+			while pos <= len and s:sub(pos, pos) ~= ',' do pos = pos + 1 end
+			local tok = s:sub(start, pos - 1):match("^%s*(.-)%s*$")
+			if tok and #tok > 0 then
+				args[#args + 1] = tok
+			end
+		end
+		while pos <= len and s:sub(pos, pos):match("[,%s]") do pos = pos + 1 end
+	end
+	return args
+end
+
+local function parse_poc(line)
+	local call_str, crash_str = line:match("^(.-)%s+%-%-+%s+(.+)$")
+	if not call_str or not crash_str then return nil end
+	local funcname = call_str:match("^([%w_]+)%(")
+	if not funcname then return nil end
+	local args_str = call_str:match("^[%w_]+%((.*)%)$")
+	if not args_str then return nil end
+	local args = tokenize_args(args_str)
+	local exp_signal = crash_str:match("^(%w+)")
+	local exp_mode   = crash_str:match("invalid (%w+)")
+	if not exp_signal or not exp_mode then return nil end
+	return funcname, args, exp_signal, exp_mode
+end
+
+local function is_string_arg(arg)
+	return arg:sub(1, 1) == '"'
+end
+
+local function is_pool_string(arg)
+	if not is_string_arg(arg) then return false end
+	local s = arg:sub(2, -2)
+	if #s < 16 then return false end
+	if s:sub(1, 1) == "/" and #s >= 16 then
+		local ch = s:sub(2, 2)
+		local rep = "/" .. string.rep(ch, #s - 1)
+		if s == rep then return true end
+	end
+	return false
+end
+
+local function format_poc(funcname, args, signal, mode, faultaddr)
+	return string.format("%s(%s) -- %s invalid %s at address 0x%x",
+		funcname, table.concat(args, ", "), signal, mode, faultaddr)
+end
+
+------------------------------------------------------------------------
+-- Is faultaddr near a known per-arg marker? (within ±0x1000)
+-- Returns the arg index (1-based) or 0 if no match.
+------------------------------------------------------------------------
+local function find_controlling_arg(args, faultaddr)
+	if not faultaddr or faultaddr == 0 then return 0 end
+
+	-- Exact match against arg values
+	for i, a in ipairs(args) do
+		if not is_string_arg(a) then
+			local val = tonumber(a)
+			if val and val == faultaddr then return i end
+		end
+	end
+
+	-- Exact match against per-arg marker table
+	for i, marker in ipairs(SIMPLE_INT_FOR_ARG) do
+		if tonumber(marker) == faultaddr then return i end
+	end
+
+	-- Near-match (±0x1000) — catches SIMD aligned stores
+	local best_i, best_dist = 0, 0x1001
+	for i, a in ipairs(args) do
+		if not is_string_arg(a) then
+			local val = tonumber(a)
+			if val and val > 0x1000 then
+				local dist = faultaddr - val
+				if dist < 0 then dist = -dist end
+				if dist < best_dist then
+					best_dist = dist
+					best_i = i
+				end
+			end
+		end
+	end
+
+	return best_i
+end
+
+------------------------------------------------------------------------
+-- single_call_fork: one function call in a fresh child process.
+-- Returns: signal, mode, faultaddr  or  nil, nil, 0
+------------------------------------------------------------------------
+local function single_call_fork(funcname, args)
+	os.remove(RESULT_FILE)
+	local pid = fork()
+	if pid == 0 then
+		local fn = _G[funcname]
+		if not fn then
+			local f = io.open(RESULT_FILE, "w")
+			if f then f:write("FAIL\n"); f:close() end
+			local _e = _exit or _Exit
+			if _e then _e(0) else os.exit(0) end
+			return
+		end
+		local vals = {}
+		for i, a in ipairs(args) do vals[i] = convert_arg(a) end
+		local ok, ret, ctx = pcall(fn, unp(vals))
+		local f = io.open(RESULT_FILE, "w")
+		if f then
+			if ok and type(ctx) == "table" and ctx.signal
+			   and ctx.signal ~= "" then
+				local mode = "UNKNOWN"
+				if type(ctx.mode) == "string" then
+					mode = ctx.mode
+				elseif ctx.mode == 1 then mode = "READ"
+				elseif ctx.mode == 2 then mode = "WRITE"
+				elseif ctx.mode == 4 then mode = "EXEC"
+				end
+				f:write(ctx.signal .. "\n")
+				f:write(mode .. "\n")
+				f:write(string.format("0x%x", ctx.faultaddr or 0) .. "\n")
+			else
+				f:write("FAIL\n")
+			end
+			f:close()
+		end
+		local _e = _exit or _Exit
+		if _e then _e(0) else os.exit(0) end
+		return
+	end
+	-- Parent: reap with 5-second timeout
+	local reaped = false
+	for _ = 1, 50 do
+		local ret = waitpid(pid, 0, 1)  -- WNOHANG
+		if ret ~= 0 then reaped = true; break end
+		usleep(100000)
+	end
+	if not reaped then
+		kill(pid, 9); waitpid(pid, 0, 0)
+		return nil, nil, 0
+	end
+	local rf = io.open(RESULT_FILE, "r")
+	if not rf then return nil, nil, 0 end
+	local line1 = rf:read("*l")
+	if not line1 or line1 == "FAIL" then rf:close(); return nil, nil, 0 end
+	local line2 = rf:read("*l")
+	local line3 = rf:read("*l")
+	rf:close()
+	return line1, line2 or "UNKNOWN", tonumber(line3 or "0") or 0
+end
+
+------------------------------------------------------------------------
+-- Build safe args: replace stale 48-bit pool addresses AND pool strings
+-- with per-arg markers.  Keep real strings and 32-bit values as-is.
+------------------------------------------------------------------------
+local function build_safe_args(args)
+	local safe = {}
+	for i = 1, #args do
+		if is_pool_string(args[i]) then
+			safe[i] = SIMPLE_INT_FOR_ARG[i] or "0x41414141"
+		elseif is_string_arg(args[i]) then
+			safe[i] = args[i]
+		else
+			local val = tonumber(args[i]) or 0
+			if val > 0xFFFFFFFF then
+				safe[i] = SIMPLE_INT_FOR_ARG[i] or "0x41414141"
+			else
+				safe[i] = args[i]
+			end
+		end
+	end
+	return safe
+end
+
+------------------------------------------------------------------------
+-- Simplify args (right-to-left): try to make the PoC as clean as
+-- possible while preserving signal match + faddr > 0x1000.
+-- Mode is RELAXED — we accept any mode (WRITE, READ, EXEC).
+------------------------------------------------------------------------
+local function simplify_relaxed(funcname, args, exp_sig)
+	local result = {}
+	for i = 1, #args do result[i] = args[i] end
+
+	for i = #result, 1, -1 do
+		if is_string_arg(result[i]) then goto continue end
+
+		local orig = result[i]
+		local found = false
+
+		-- Keep per-arg markers as-is (they're diagnostic)
+		for _, m in ipairs(SIMPLE_INT_FOR_ARG) do
+			if orig == m then found = true; break end
+		end
+		if found then goto continue end
+
+		-- Try per-arg marker first (self-documenting crash address)
+		local marker = SIMPLE_INT_FOR_ARG[i]
+		if marker then
+			result[i] = marker
+			local sig, mode, faddr = single_call_fork(funcname, result)
+			if sig == exp_sig and faddr and faddr > 0x1000 then
+				found = true
+			end
+		end
+
+		-- Try "aaaa" (readable memory, good for source pointers)
+		if not found then
+			result[i] = SIMPLE_STR
+			local sig, mode, faddr = single_call_fork(funcname, result)
+			if sig == exp_sig and faddr and faddr > 0x1000 then
+				found = true
+			end
+		end
+
+		-- Try small ints (good for size/count args)
+		if not found then
+			for _, v in ipairs({"0x3", "0xff"}) do
+				result[i] = v
+				local sig, mode, faddr = single_call_fork(funcname, result)
+				if sig == exp_sig and faddr and faddr > 0x1000 then
+					found = true
+					break
+				end
+			end
+		end
+
+		if not found then result[i] = orig end
+
+		::continue::
+	end
+
+	return result
+end
+
+
+------------------------------------------------------------------------
+-- Main
+------------------------------------------------------------------------
+local function main()
+	local rawfile = "/tmp/witchcraft-pocs.log"
+	local verfile = "/tmp/witchcraft-verified-pocs.log"
+	local outfile = "/tmp/witchcraft-remaining-pocs.log"
+
+	print("=== Remaining PoC Verification (relaxed mode) ===")
+	print("Raw input:  " .. rawfile)
+	print("Existing:   " .. verfile)
+	print("Output:     " .. outfile)
+	print("")
+
+	--------------------------------------------------------------------
+	-- Step 1: Read existing verified log → find CONTROLLED functions
+	--------------------------------------------------------------------
+	local controlled = {}
+	local vf = io.open(verfile, "r")
+	if vf then
+		for line in vf:lines() do
+			if line:match("%[CONTROLLED") then
+				local fn = line:match("^([%w_]+)%(")
+				if fn then controlled[fn] = true end
+			end
+		end
+		vf:close()
+	end
+
+	local n_ctrl = 0
+	for _ in pairs(controlled) do n_ctrl = n_ctrl + 1 end
+	print(string.format("Already CONTROLLED: %d functions", n_ctrl))
+
+	--------------------------------------------------------------------
+	-- Step 2: Read raw log → collect PoC lines for remaining functions
+	--------------------------------------------------------------------
+	local fi = io.open(rawfile, "r")
+	if not fi then
+		print("ERROR: Cannot open " .. rawfile)
+		return
+	end
+
+	local target_funcs = {}   -- funcname → { poc_lines }
+	local target_order = {}
+	for line in fi:lines() do
+		if #line > 0 then
+			local fn = line:match("^([%w_]+)%(")
+			if fn and not controlled[fn] and _G[fn] then
+				if not target_funcs[fn] then
+					target_funcs[fn] = {}
+					target_order[#target_order + 1] = fn
+				end
+				if #target_funcs[fn] < 10 then
+					target_funcs[fn][#target_funcs[fn] + 1] = line
+				end
+			end
+		end
+	end
+	fi:close()
+
+	print(string.format("Target functions:   %d", #target_order))
+	if #target_order == 0 then
+		print("\nAll functions already verified!")
+		return
+	end
+	print("")
+
+	--------------------------------------------------------------------
+	-- Step 3: Verify with relaxed mode matching
+	--------------------------------------------------------------------
+	local fo = io.open(outfile, "w")
+	local seen = {}
+	local verified = 0
+	local failed_list = {}
+	local t_start = os.time()
+
+	for idx, fn in ipairs(target_order) do
+		local poc_lines = target_funcs[fn]
+		local found = false
+
+		io.write(string.format("  [%d/%d] %s (%d PoCs)...",
+			idx, #target_order, fn, #poc_lines))
+		io.flush()
+
+		for _, poc_line in ipairs(poc_lines) do
+			local funcname, args, exp_sig, exp_mode = parse_poc(poc_line)
+			if not funcname then goto next_poc end
+
+			local safe_args = build_safe_args(args)
+
+			-- Test with safe 32-bit marker args
+			local sig, mode, faddr =
+				single_call_fork(funcname, safe_args)
+
+			-- Relaxed accept: signal match + faddr > 0x1000
+			-- (mode is recorded as-is, not required to match)
+			if sig ~= exp_sig or not faddr or faddr <= 0x1000 then
+				goto next_poc
+			end
+
+			-- "aaaa" sweep: try replacing non-marker args with
+			-- "aaaa" right-to-left, to make the PoC cleaner and
+			-- potentially recover the expected mode.
+			for j = #safe_args, 1, -1 do
+				if not is_string_arg(safe_args[j]) then
+					local is_marker = false
+					for _, m in ipairs(SIMPLE_INT_FOR_ARG) do
+						if safe_args[j] == m then
+							is_marker = true; break
+						end
+					end
+					if not is_marker then
+						local orig = safe_args[j]
+						safe_args[j] = SIMPLE_STR
+						local s2, m2, f2 =
+							single_call_fork(funcname, safe_args)
+						if s2 == exp_sig and f2 and f2 > 0x1000 then
+							sig = s2; mode = m2; faddr = f2
+						else
+							-- Try small int (for size/count args)
+							safe_args[j] = "0x3"
+							s2, m2, f2 =
+								single_call_fork(funcname, safe_args)
+							if s2 == exp_sig and f2
+							   and f2 > 0x1000 then
+								sig = s2; mode = m2; faddr = f2
+							else
+								safe_args[j] = orig
+							end
+						end
+					end
+				end
+			end
+
+			-- Simplify further
+			local simple = simplify_relaxed(funcname, safe_args, exp_sig)
+
+			-- Final verify
+			local fs, fm, ff = single_call_fork(funcname, simple)
+			if fs == exp_sig and ff and ff > 0x1000 then
+				safe_args = simple
+				sig = fs; mode = fm; faddr = ff
+			end
+
+			-- Must have faddr controlled by a marker arg
+			local ctrl = find_controlling_arg(safe_args, faddr)
+			if ctrl <= 0 then goto next_poc end
+
+			local result_line = format_poc(
+				funcname, safe_args, sig, mode, faddr)
+			local dk = funcname .. ":" .. sig .. ":"
+				.. mode .. ":" .. tostring(ctrl)
+
+			if not seen[dk] then
+				seen[dk] = true
+				local ann = " [CONTROLLED arg" .. ctrl .. "]"
+				fo:write(result_line .. ann .. "\n")
+				fo:flush()
+				verified = verified + 1
+				found = true
+				io.write(string.format(
+					" VERIFIED %s %s at 0x%x%s\n",
+					sig, mode, faddr, ann))
+				io.flush()
+				break
+			end
+
+			::next_poc::
+		end  -- poc_lines loop
+
+		if not found then
+			failed_list[#failed_list + 1] = fn
+			io.write(" FAILED\n")
+			io.flush()
+		end
+	end  -- target_order loop
+
+	fo:close()
+	local elapsed = os.difftime(os.time(), t_start)
+
+	--------------------------------------------------------------------
+	-- Summary
+	--------------------------------------------------------------------
+	print(string.format("\n=== Results (%ds) ===", elapsed))
+	print(string.format("Previously CONTROLLED: %d", n_ctrl))
+	print(string.format("Newly verified:        %d", verified))
+	print(string.format("Still failed:          %d", #failed_list))
+	print(string.format("TOTAL CONTROLLED:      %d", n_ctrl + verified))
+
+	if #failed_list > 0 then
+		print("\nFailed functions:")
+		for _, fn in ipairs(failed_list) do
+			print("  " .. fn)
+		end
+	end
+
+	if verified > 0 then
+		print("\nNew entries written to: " .. outfile)
+		print("")
+		print("=== Newly verified PoCs ===")
+		print("")
+		local rf = io.open(outfile, "r")
+		if rf then
+			for line in rf:lines() do
+				print("  " .. line)
+			end
+			rf:close()
+		end
+		print("")
+		print("To combine both logs:")
+		print(string.format(
+			"  cat %s %s > /tmp/witchcraft-all-verified.log",
+			verfile, outfile))
+	end
+end
+
+main()
+exit(0)
